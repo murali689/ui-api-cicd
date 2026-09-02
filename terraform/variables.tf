@@ -7,7 +7,7 @@ variable "resource_group_name" {
 variable "location" {
   description = "Azure region to deploy resources into"
   type        = string
-  default     = "East US"
+  default     = "Central India"
 }
 
 variable "app_service_plan_name" {
@@ -32,4 +32,10 @@ variable "sku_name" {
   description = "SKU for the App Service Plan"
   type        = string
   default     = "B1"
+}
+
+variable "key_vault_name" {
+  description = "Globally unique Azure Key Vault name"
+  type        = string
+  default     = "taskmgmtkv2026"
 }
