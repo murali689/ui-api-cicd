@@ -478,7 +478,10 @@ jobs:
   #
   # This happens ONLY after successful tag creation.
   # ============================================================
-    bump-version:
+  # ============================================================
+  # JOB 8: BUMP VERSION IN KEY VAULT
+  # ============================================================
+  bump-version:
     name: Bump Key Vault Version
 
     needs:
@@ -493,6 +496,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+
       - name: Login to Azure
         uses: azure/login@v2
         with:
