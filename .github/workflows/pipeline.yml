@@ -5,27 +5,51 @@ on:
     branches:
       - main
 
+  workflow_dispatch:
+    inputs:
+      deployment_tag:
+        description: "Existing deployment tag to deploy, for example dev-1.0.0"
+        required: true
+        type: string
+
 permissions:
   id-token: write
-  contents: read
+  contents: write
+
+concurrency:
+  group: task-management-deployment
+  cancel-in-progress: false
+
+env:
+  KEY_VAULT_NAME: taskmgmtkv2026
+  VERSION_SECRET_NAME: pipeline-version
 
 jobs:
-  # ---------------------------------------------------------------------
-  # Detects which part(s) of the repo changed: UI/, API/, or both.
-  # ---------------------------------------------------------------------
+
+  # ============================================================
+  # JOB 1: DETECT CHANGES
+  # ============================================================
   detect-changes:
     name: Detect Changes
     runs-on: ubuntu-latest
+
     outputs:
-      ui_changed: ${{ steps.filter.outputs.ui }}
-      api_changed: ${{ steps.filter.outputs.api }}
+      ui_changed: ${{ steps.changes.outputs.ui_changed }}
+      api_changed: ${{ steps.changes.outputs.api_changed }}
+
     steps:
+
+      # ----------------------------------------------------------
+      # Normal push to main
+      # ----------------------------------------------------------
       - name: Checkout repository
+        if: github.event_name == 'push'
         uses: actions/checkout@v4
         with:
           fetch-depth: 2
 
       - name: Detect changed paths
+        if: github.event_name == 'push'
         id: filter
         uses: dorny/paths-filter@v3
         with:
@@ -35,34 +59,152 @@ jobs:
             api:
               - 'API/**'
 
-  # ---------------------------------------------------------------------
-  # Build UI (React + Vite) - only runs when UI/ changed
-  # ---------------------------------------------------------------------
+      # ----------------------------------------------------------
+      # Set final outputs
+      #
+      # Normal push:
+      #   UI/API values come from paths-filter
+      #
+      # Manual tag:
+      #   Both UI and API are built
+      # ----------------------------------------------------------
+      - name: Set change outputs
+        id: changes
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Manual tag deployment detected."
+            echo "UI will be built."
+            echo "API will be built."
+
+            echo "ui_changed=true" >> "$GITHUB_OUTPUT"
+            echo "api_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Normal push deployment detected."
+
+            echo "UI changed: ${{ steps.filter.outputs.ui }}"
+            echo "API changed: ${{ steps.filter.outputs.api }}"
+
+            echo "ui_changed=${{ steps.filter.outputs.ui }}" >> "$GITHUB_OUTPUT"
+            echo "api_changed=${{ steps.filter.outputs.api }}" >> "$GITHUB_OUTPUT"
+          fi
+
+
+  # ============================================================
+  # JOB 2: GET VERSION FROM AZURE KEY VAULT
+  # ============================================================
+  get-version:
+    name: Get Version from Key Vault
+    runs-on: ubuntu-latest
+
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Read version from Key Vault
+        id: version
+        shell: bash
+        run: |
+          echo "Reading deployment version from Azure Key Vault..."
+
+          VERSION=$(az keyvault secret show \
+            --vault-name "$KEY_VAULT_NAME" \
+            --name "$VERSION_SECRET_NAME" \
+            --query value \
+            --output tsv)
+
+          if [ -z "$VERSION" ]; then
+            echo "ERROR: Version was not found in Azure Key Vault."
+            exit 1
+          fi
+
+          echo "Version from Key Vault: $VERSION"
+
+          # Validate version format
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "ERROR: Invalid version format: $VERSION"
+            echo "Expected format: X.Y.Z"
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+
+  # ============================================================
+  # JOB 3: BUILD UI
+  # ============================================================
   build-ui:
     name: Build UI
-    needs: detect-changes
+
+    needs:
+      - detect-changes
+      - get-version
+
     if: needs.detect-changes.outputs.ui_changed == 'true'
+
     runs-on: ubuntu-latest
+
     steps:
+
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.deployment_tag || github.ref }}
+
+      - name: Show source reference
+        run: |
+          echo "Event: ${{ github.event_name }}"
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Deploying existing tag: ${{ inputs.deployment_tag }}"
+          else
+            echo "Deploying branch: main"
+          fi
+
+      - name: Show deployment version
+        run: |
+          echo "Deployment version from Key Vault:"
+          echo "${{ needs.get-version.outputs.version }}"
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
-          cache: 'npm'
+          node-version: "20"
+          cache: "npm"
           cache-dependency-path: UI/package-lock.json
 
-      - name: Install dependencies
+      - name: Install UI dependencies
         working-directory: UI
-        run: npm install
+        run: npm ci
 
       - name: Build UI
         working-directory: UI
         env:
           VITE_API_URL: ${{ secrets.VITE_API_URL }}
-        run: npm run build
+        run: |
+          echo "Building UI..."
+          echo "VITE_API_URL=$VITE_API_URL"
+
+          npm run build
+
+      - name: Verify UI build
+        working-directory: UI
+        run: |
+          if [ ! -d "dist" ]; then
+            echo "ERROR: UI dist directory was not created."
+            exit 1
+          fi
+
+          echo "UI build successful."
+          ls -la dist
 
       - name: Upload UI build artifact
         uses: actions/upload-artifact@v4
@@ -70,28 +212,68 @@ jobs:
           name: ui-build
           path: UI/dist
 
-  # ---------------------------------------------------------------------
-  # Build API (Spring Boot + Maven) - only runs when API/ changed
-  # ---------------------------------------------------------------------
+
+  # ============================================================
+  # JOB 4: BUILD API
+  # ============================================================
   build-api:
     name: Build API
-    needs: detect-changes
+
+    needs:
+      - detect-changes
+      - get-version
+
     if: needs.detect-changes.outputs.api_changed == 'true'
+
     runs-on: ubuntu-latest
+
     steps:
+
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.deployment_tag || github.ref }}
+
+      - name: Show source reference
+        run: |
+          echo "Event: ${{ github.event_name }}"
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Deploying existing tag: ${{ inputs.deployment_tag }}"
+          else
+            echo "Deploying branch: main"
+          fi
+
+      - name: Show deployment version
+        run: |
+          echo "Deployment version from Key Vault:"
+          echo "${{ needs.get-version.outputs.version }}"
 
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
-          distribution: 'temurin'
-          java-version: '17'
-          cache: 'maven'
+          distribution: "temurin"
+          java-version: "17"
+          cache: "maven"
+          cache-dependency-path: API/pom.xml
 
       - name: Build API
         working-directory: API
-        run: mvn clean package -DskipTests
+        run: |
+          echo "Building API..."
+
+          mvn clean package -DskipTests
+
+      - name: Verify API build
+        working-directory: API
+        run: |
+          if [ ! -f "target/api.jar" ]; then
+            echo "ERROR: API JAR was not created."
+            exit 1
+          fi
+
+          echo "API build successful."
+          ls -lh target/api.jar
 
       - name: Upload API build artifact
         uses: actions/upload-artifact@v4
@@ -99,21 +281,47 @@ jobs:
           name: api-build
           path: API/target/api.jar
 
-  # ---------------------------------------------------------------------
-  # Deploy UI to Azure App Service - only runs if Build UI succeeded
-  # ---------------------------------------------------------------------
+
+  # ============================================================
+  # JOB 5: DEPLOY UI
+  # ============================================================
   deploy-ui:
     name: Deploy UI
-    needs: [detect-changes, build-ui]
-    if: needs.detect-changes.outputs.ui_changed == 'true' && needs.build-ui.result == 'success'
+
+    needs:
+      - detect-changes
+      - build-ui
+
+    if: |
+      needs.detect-changes.outputs.ui_changed == 'true' &&
+      needs.build-ui.result == 'success'
+
     runs-on: ubuntu-latest
+
     steps:
+
       - name: Download UI build artifact
         uses: actions/download-artifact@v4
         with:
           name: ui-build
           path: dist
 
+      - name: Show deployment information
+        run: |
+          echo "========================================="
+          echo "UI DEPLOYMENT"
+          echo "========================================="
+          echo "Event: ${{ github.event_name }}"
+          echo "Application: ${{ secrets.AZURE_UI_APP_NAME }}"
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Source tag: ${{ inputs.deployment_tag }}"
+          else
+            echo "Source branch: main"
+          fi
+
+          echo "========================================="
+
       - name: Login to Azure
         uses: azure/login@v2
         with:
@@ -121,27 +329,57 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Deploy to Azure App Service (UI)
+      - name: Deploy UI to Azure App Service
         uses: azure/webapps-deploy@v3
         with:
           app-name: ${{ secrets.AZURE_UI_APP_NAME }}
           package: dist
 
-  # ---------------------------------------------------------------------
-  # Deploy API to Azure App Service - only runs if Build API succeeded
-  # ---------------------------------------------------------------------
+      - name: UI deployment successful
+        run: |
+          echo "UI deployment completed successfully."
+
+
+  # ============================================================
+  # JOB 6: DEPLOY API
+  # ============================================================
   deploy-api:
     name: Deploy API
-    needs: [detect-changes, build-api]
-    if: needs.detect-changes.outputs.api_changed == 'true' && needs.build-api.result == 'success'
+
+    needs:
+      - detect-changes
+      - build-api
+
+    if: |
+      needs.detect-changes.outputs.api_changed == 'true' &&
+      needs.build-api.result == 'success'
+
     runs-on: ubuntu-latest
+
     steps:
+
       - name: Download API build artifact
         uses: actions/download-artifact@v4
         with:
           name: api-build
           path: api-artifact
 
+      - name: Show deployment information
+        run: |
+          echo "========================================="
+          echo "API DEPLOYMENT"
+          echo "========================================="
+          echo "Event: ${{ github.event_name }}"
+          echo "Application: ${{ secrets.AZURE_API_APP_NAME }}"
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Source tag: ${{ inputs.deployment_tag }}"
+          else
+            echo "Source branch: main"
+          fi
+
+          echo "========================================="
+
       - name: Login to Azure
         uses: azure/login@v2
         with:
@@ -149,8 +387,170 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Deploy to Azure App Service (API)
+      - name: Deploy API to Azure App Service
         uses: azure/webapps-deploy@v3
         with:
           app-name: ${{ secrets.AZURE_API_APP_NAME }}
           package: api-artifact/api.jar
+
+      - name: API deployment successful
+        run: |
+          echo "API deployment completed successfully."
+
+
+  # ============================================================
+  # JOB 7: CREATE DEPLOYMENT TAG
+  #
+  # ONLY runs for normal push to main.
+  #
+  # Example:
+  #
+  # Key Vault = 1.0.0
+  #       ↓
+  # Successful deployment
+  #       ↓
+  # dev-1.0.0
+  #
+  # Manual tag deployment does NOT create another tag.
+  # ============================================================
+  create-tag:
+    name: Create Deployment Tag
+
+    needs:
+      - detect-changes
+      - get-version
+      - deploy-ui
+      - deploy-api
+
+    if: |
+      github.event_name == 'push' &&
+      (
+        (
+          needs.detect-changes.outputs.ui_changed == 'true' &&
+          needs.deploy-ui.result == 'success'
+        )
+        ||
+        (
+          needs.detect-changes.outputs.api_changed == 'true' &&
+          needs.deploy-api.result == 'success'
+        )
+      )
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create deployment tag
+        env:
+          VERSION: ${{ needs.get-version.outputs.version }}
+        shell: bash
+        run: |
+          TAG="dev-$VERSION"
+
+          echo "========================================="
+          echo "CREATING DEPLOYMENT TAG"
+          echo "========================================="
+          echo "Version: $VERSION"
+          echo "Tag:     $TAG"
+          echo "========================================="
+
+          # Check if tag already exists
+          if git ls-remote --tags origin "refs/tags/$TAG" | grep -q "refs/tags/$TAG"; then
+            echo "ERROR: Tag $TAG already exists."
+            echo "Pipeline will stop to avoid overwriting an existing deployment tag."
+            exit 1
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git tag "$TAG"
+
+          git push origin "$TAG"
+
+          echo "Deployment tag created successfully: $TAG"
+
+
+  # ============================================================
+  # JOB 8: BUMP VERSION IN KEY VAULT
+  #
+  # Example:
+  #
+  # Current = 1.0.0
+  # New     = 1.0.1
+  #
+  # This happens ONLY after successful tag creation.
+  # ============================================================
+  bump-version:
+    name: Bump Key Vault Version
+
+    needs:
+      - create-tag
+      - get-version
+
+    if: |
+      github.event_name == 'push' &&
+      needs.create-tag.result == 'success'
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Calculate next version
+        id: next-version
+        env:
+          CURRENT_VERSION: ${{ needs.get-version.outputs.version }}
+        shell: bash
+        run: |
+          echo "Current version: $CURRENT_VERSION"
+
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT_VERSION"
+
+          NEW_PATCH=$((PATCH + 1))
+
+          NEW_VERSION="$MAJOR.$MINOR.$NEW_PATCH"
+
+          echo "New version: $NEW_VERSION"
+
+          echo "new_version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Update version in Key Vault
+        env:
+          NEW_VERSION: ${{ steps.next-version.outputs.new_version }}
+        shell: bash
+        run: |
+          echo "Updating Azure Key Vault..."
+
+          az keyvault secret set \
+            --vault-name "$KEY_VAULT_NAME" \
+            --name "$VERSION_SECRET_NAME" \
+            --value "$NEW_VERSION"
+
+          echo "========================================="
+          echo "KEY VAULT VERSION UPDATED"
+          echo "========================================="
+          echo "New version: $NEW_VERSION"
+          echo "========================================="
+
+      - name: Verify Key Vault version
+        shell: bash
+        run: |
+          VERSION=$(az keyvault secret show \
+            --vault-name "$KEY_VAULT_NAME" \
+            --name "$VERSION_SECRET_NAME" \
+            --query value \
+            --output tsv)
+
+          echo "Key Vault currently contains: $VERSION"
