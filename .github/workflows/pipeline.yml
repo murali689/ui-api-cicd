@@ -423,6 +423,7 @@ jobs:
       - deploy-api
 
     if: |
+      always() &&
       github.event_name == 'push' &&
       (
         (
@@ -439,7 +440,6 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
@@ -452,17 +452,11 @@ jobs:
         run: |
           TAG="dev-$VERSION"
 
-          echo "========================================="
-          echo "CREATING DEPLOYMENT TAG"
-          echo "========================================="
-          echo "Version: $VERSION"
-          echo "Tag:     $TAG"
-          echo "========================================="
+          echo "Current version: $VERSION"
+          echo "Creating tag: $TAG"
 
-          # Check if tag already exists
           if git ls-remote --tags origin "refs/tags/$TAG" | grep -q "refs/tags/$TAG"; then
             echo "ERROR: Tag $TAG already exists."
-            echo "Pipeline will stop to avoid overwriting an existing deployment tag."
             exit 1
           fi
 
@@ -470,11 +464,9 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git tag "$TAG"
-
           git push origin "$TAG"
 
-          echo "Deployment tag created successfully: $TAG"
-
+          echo "Successfully created deployment tag: $TAG"
 
   # ============================================================
   # JOB 8: BUMP VERSION IN KEY VAULT
@@ -486,7 +478,7 @@ jobs:
   #
   # This happens ONLY after successful tag creation.
   # ============================================================
-  bump-version:
+    bump-version:
     name: Bump Key Vault Version
 
     needs:
@@ -494,13 +486,13 @@ jobs:
       - get-version
 
     if: |
+      always() &&
       github.event_name == 'push' &&
       needs.create-tag.result == 'success'
 
     runs-on: ubuntu-latest
 
     steps:
-
       - name: Login to Azure
         uses: azure/login@v2
         with:
@@ -519,30 +511,23 @@ jobs:
           IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT_VERSION"
 
           NEW_PATCH=$((PATCH + 1))
-
           NEW_VERSION="$MAJOR.$MINOR.$NEW_PATCH"
 
           echo "New version: $NEW_VERSION"
 
           echo "new_version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Update version in Key Vault
+      - name: Update Key Vault
         env:
           NEW_VERSION: ${{ steps.next-version.outputs.new_version }}
         shell: bash
         run: |
-          echo "Updating Azure Key Vault..."
-
           az keyvault secret set \
             --vault-name "$KEY_VAULT_NAME" \
             --name "$VERSION_SECRET_NAME" \
             --value "$NEW_VERSION"
 
-          echo "========================================="
-          echo "KEY VAULT VERSION UPDATED"
-          echo "========================================="
-          echo "New version: $NEW_VERSION"
-          echo "========================================="
+          echo "Key Vault updated to: $NEW_VERSION"
 
       - name: Verify Key Vault version
         shell: bash
@@ -553,4 +538,4 @@ jobs:
             --query value \
             --output tsv)
 
-          echo "Key Vault currently contains: $VERSION"
+          echo "Current Key Vault version: $VERSION"
